@@ -1,15 +1,24 @@
 # Model calibration results
 
-Each experiment branch below trains `train.py` on `data/titanic.csv` with an
-80/20 stratified train/val split (`--seed 42`) and reports the best validation
-accuracy achieved during training.
+Branches `baseline-mlp` through `tuned-mlp-v4` below train `train.py` on
+`data/titanic.csv` with a single 80/20 stratified train/val split (`--seed 42`)
+and report the best validation accuracy achieved during training.
+
+`experiment/kfold-ticket-ensemble` switches to 5-fold stratified
+cross-validation instead, which is a more rigorous (if less flattering)
+evaluation protocol: every row gets predicted exactly once by a model that
+never trained on it ("out-of-fold", or OOF, accuracy), rather than a single
+lucky/unlucky 20% slice. Its numbers are **not directly comparable** to the
+single-split accuracies above — see that section for a fair, apples-to-apples
+comparison against v4 re-measured under the same k-fold protocol.
 
 | Branch | Features | Architecture | Epochs | Best val accuracy |
 | --- | --- | --- | --- | --- |
 | `experiment/baseline-mlp` | Raw columns (Pclass, Sex, Age, SibSp, Parch, Fare, Embarked), median/mode imputation | 1 hidden layer (16 units) | 20 | 79.89% |
-| `experiment/tuned-mlp-v2` | + Title (from name), FamilySize, log(Fare), group-wise median imputation, class-weighted loss | 2 hidden layers (64, 32) + BatchNorm + Dropout(0.3) | 150 | **84.36%** |
+| `experiment/tuned-mlp-v2` | + Title (from name), FamilySize, log(Fare), group-wise median imputation, class-weighted loss | 2 hidden layers (64, 32) + BatchNorm + Dropout(0.3) | 150 | 84.36% |
 | `experiment/tuned-mlp-v3` | + Deck (from Cabin, mostly "unknown") on top of v2 features | 3 hidden layers (128, 64, 32) + BatchNorm + Dropout(0.25) | 200 | 82.68% |
-| `experiment/tuned-mlp-v4` | Same features as v2 (Title, FamilySize, log(Fare)) | 2 hidden layers (32, 16) + BatchNorm + Dropout(0.2) | 150 | **84.92%** |
+| `experiment/tuned-mlp-v4` | Same features as v2 (Title, FamilySize, log(Fare)) | 2 hidden layers (32, 16) + BatchNorm + Dropout(0.2) | 150 | 84.92% (single-split) |
+| `experiment/kfold-ticket-ensemble` | Same features as v4 | Same as v4, trained as a 5-model k-fold ensemble | 150 x 5 folds | **84.18% OOF** (honest CV estimate) |
 
 ## experiment/baseline-mlp
 
@@ -85,10 +94,52 @@ Result: **84.92%** validation accuracy with a *smaller* (32, 16) network and
 lighter dropout than v2, using the exact same features as v2. On a dataset
 this small (891 rows), extra engineered features and a bigger network both
 tended to overfit rather than help; the win came from reducing model capacity
-to match the amount of training data. This is the best result across all
-branches and was merged into `main`.
+to match the amount of training data. This was the best result across all
+branches under the single-split protocol and was merged into `main` — see the
+next branch for a more rigorous re-evaluation of this exact config.
+
+## experiment/kfold-ticket-ensemble
+
+Command:
+
+```bash
+python train.py --data data/titanic.csv --output titanic_model.pt --epochs 150 --n_folds 5
+```
+
+The single 80/20 split used by every branch above has only 179 validation
+rows, so one extra correct/incorrect prediction swings accuracy by ~0.56% —
+large enough to make small architecture differences look meaningful when they
+might just be noise from a lucky split. This branch replaces that with
+5-fold stratified cross-validation: each fold trains on 80% and validates on
+a disjoint 20%, and out-of-fold (OOF) predictions cover the *entire* dataset
+exactly once, giving a single unbiased accuracy number. The final checkpoint
+bundles all 5 folds' models as an ensemble, and `predict.py` averages their
+predicted probabilities at inference time (a standard variance-reduction
+technique).
+
+Two things were tried:
+- **Re-measuring v4's exact config (architecture 32/16, dropout 0.2, v2's
+  features) under 5-fold CV**: **84.18%** OOF accuracy (fold range 83.24%-
+  84.83%, std 0.63%). This is close to v4's reported 84.92%, which suggests
+  v4's single-split number was only mildly optimistic, not pure noise — the
+  model's real generalization is genuinely around 84%.
+- **Adding a `TicketGroupSize` feature** (count of passengers sharing the same
+  `Ticket` string, capturing non-family travel groups that `FamilySize`
+  misses) on top of v4's config, under the same 5-fold protocol: **83.05%**
+  OOF accuracy — *worse*. It's too collinear with `FamilySize` (most groups
+  are size 1) and adds noise rather than signal, so it was dropped.
+
+Result: **84.18%** out-of-fold accuracy — the most trustworthy accuracy
+estimate produced so far for this feature set/architecture, and the deployed
+model is now a 5-way ensemble rather than a single lucky-split checkpoint,
+which should be at least as robust on genuinely new passengers. `TicketGroupSize`
+is a documented negative result: a plausible feature that measurably didn't
+help once evaluated honestly.
 
 ## Conclusion
 
-`experiment/tuned-mlp-v4` has the best validation accuracy (84.92%) and was
-merged into `main`.
+`experiment/kfold-ticket-ensemble` is the recommended model: it reuses v4's
+features/architecture (the best found so far) but replaces the single-split
+evaluation with 5-fold CV (84.18% OOF, a more honest estimate than v4's
+84.92%) and ships a 5-model ensemble instead of one checkpoint, for more
+robust predictions on genuinely new passengers. It was merged into `main`.

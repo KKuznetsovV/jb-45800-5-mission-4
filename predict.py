@@ -4,6 +4,9 @@ predict.py
 
 Predict Titanic survival for one passenger using a checkpoint from train.py.
 
+The checkpoint holds an ensemble of k-fold models; predictions are averaged
+across all folds.
+
 Example (foreign input, not part of the training data):
     python predict.py --model titanic_model.pt --pclass 3 --sex male --age 22 \\
         --sibsp 1 --parch 0 --fare 7.25 --embarked S --name "Doe, Mr. John"
@@ -86,7 +89,7 @@ def extract_title(name: str | None, sex: str, age: float) -> str:
     return "Miss" if age < 15 else "Mrs"
 
 
-def build_feature_vector(args: argparse.Namespace, checkpoint: dict) -> torch.Tensor:
+def build_feature_vector(args: argparse.Namespace, checkpoint: dict, mean: list[float], std: list[float]) -> torch.Tensor:
     title = extract_title(args.name, args.sex, args.age)
     family_size = args.sibsp + args.parch + 1
 
@@ -96,8 +99,6 @@ def build_feature_vector(args: argparse.Namespace, checkpoint: dict) -> torch.Te
         "Fare": float(np.log1p(args.fare)),
         "FamilySize": float(family_size),
     }
-    mean = checkpoint["numeric_mean"]
-    std = checkpoint["numeric_std"]
     values = [
         (raw_numeric[column] - mean[i]) / std[i] for i, column in enumerate(numeric_columns)
     ]
@@ -114,17 +115,20 @@ def predict(args: argparse.Namespace) -> tuple[float, int]:
     device = choose_device()
     checkpoint = load_checkpoint(args.model, device)
 
-    model = build_model(
-        len(checkpoint["feature_columns"]), checkpoint["hidden_sizes"], checkpoint["dropout"]
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    probabilities = []
+    for fold in checkpoint["folds"]:
+        model = build_model(
+            len(checkpoint["feature_columns"]), checkpoint["hidden_sizes"], checkpoint["dropout"]
+        ).to(device)
+        model.load_state_dict(fold["model_state_dict"])
+        model.eval()
 
-    features = build_feature_vector(args, checkpoint).to(device)
-    with torch.inference_mode():
-        logit = model(features).squeeze(1)
-        probability = torch.sigmoid(logit).item()
+        features = build_feature_vector(args, checkpoint, fold["numeric_mean"], fold["numeric_std"]).to(device)
+        with torch.inference_mode():
+            logit = model(features).squeeze(1)
+            probabilities.append(torch.sigmoid(logit).item())
 
+    probability = sum(probabilities) / len(probabilities)
     return probability, int(probability >= 0.5)
 
 

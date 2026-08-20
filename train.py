@@ -8,9 +8,15 @@ Tuned v4: same engineered features as v2 (title extracted from name, family
 size, log-fare transform, group-wise median imputation) but a smaller,
 lighter-regularized network, which generalizes better on this small dataset.
 
+k-fold + ensemble: replaces the single 80/20 split with stratified k-fold
+cross-validation. Each fold's best model is kept and the final checkpoint
+bundles all folds as an ensemble, which predict.py averages over at inference
+time. (A TicketGroupSize feature was also tried here but measurably hurt the
+out-of-fold accuracy -- see RESULTS.md -- so it was dropped.)
+
 Usage:
     python train.py --data data/titanic.csv --output titanic_model.pt
-    python train.py --data data/titanic.csv --epochs 150 --hidden_sizes 32,16
+    python train.py --data data/titanic.csv --epochs 150 --hidden_sizes 32,16 --n_folds 5
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -52,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--val_split", type=float, default=0.2)
+    parser.add_argument("--n_folds", type=int, default=5, help="Number of stratified CV folds.")
     parser.add_argument("--hidden_sizes", type=str, default="32,16", help="Comma-separated hidden layer sizes.")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -163,84 +169,101 @@ def train(args: argparse.Namespace) -> None:
 
     features = build_features(raw)
     feature_columns = list(features.columns)
-    labels = raw["Survived"].astype(float).to_numpy()
-
-    x_train, x_val, y_train, y_val = train_test_split(
-        features.to_numpy(dtype=np.float32),
-        labels.astype(np.float32),
-        test_size=args.val_split,
-        random_state=args.seed,
-        stratify=labels,
-    )
-
-    numeric_slice = slice(0, len(NUMERIC_COLUMNS))
-    mean = x_train[:, numeric_slice].mean(axis=0)
-    std = x_train[:, numeric_slice].std(axis=0)
-    std[std == 0] = 1.0
-    x_train[:, numeric_slice] = (x_train[:, numeric_slice] - mean) / std
-    x_val[:, numeric_slice] = (x_val[:, numeric_slice] - mean) / std
-
-    train_loader = DataLoader(
-        TensorDataset(torch.from_numpy(x_train), torch.from_numpy(y_train)),
-        batch_size=args.batch_size,
-        shuffle=True,
-    )
-    val_x = torch.from_numpy(x_val).to(device)
-    val_y = torch.from_numpy(y_val).to(device)
+    x_all = features.to_numpy(dtype=np.float32)
+    y_all = raw["Survived"].astype(np.float32).to_numpy()
 
     hidden_sizes = [int(size) for size in args.hidden_sizes.split(",") if size]
-    model = build_model(len(feature_columns), hidden_sizes, args.dropout).to(device)
+    numeric_slice = slice(0, len(NUMERIC_COLUMNS))
 
-    # Inverse-frequency positive-class weight, since ~62% of passengers did not survive.
-    pos_weight = torch.tensor([(y_train == 0).sum() / max((y_train == 1).sum(), 1)], device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=8)
+    skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
+    fold_checkpoints = []
+    fold_accuracies = []
+    # Out-of-fold predictions: each row is predicted exactly once, by a model
+    # that never saw it during training, giving an unbiased accuracy estimate.
+    oof_probabilities = np.zeros_like(y_all)
 
-    best_val_acc = -1.0
-    best_state = None
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(x_all, y_all), start=1):
+        x_train, x_val = x_all[train_idx].copy(), x_all[val_idx].copy()
+        y_train, y_val = y_all[train_idx], y_all[val_idx]
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        running_loss = 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            logits = model(xb).squeeze(1)
-            loss = criterion(logits, yb)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item() * xb.size(0)
+        mean = x_train[:, numeric_slice].mean(axis=0)
+        std = x_train[:, numeric_slice].std(axis=0)
+        std[std == 0] = 1.0
+        x_train[:, numeric_slice] = (x_train[:, numeric_slice] - mean) / std
+        x_val[:, numeric_slice] = (x_val[:, numeric_slice] - mean) / std
 
-        train_loss = running_loss / len(train_loader.dataset)
-        val_acc, val_loss = evaluate(model, val_x, val_y, criterion)
-        scheduler.step(val_acc)
+        train_loader = DataLoader(
+            TensorDataset(torch.from_numpy(x_train), torch.from_numpy(y_train)),
+            batch_size=args.batch_size,
+            shuffle=True,
+        )
+        val_x = torch.from_numpy(x_val).to(device)
+        val_y = torch.from_numpy(y_val).to(device)
 
-        if epoch % 5 == 0 or epoch == 1:
-            print(
-                f"Epoch {epoch:03d}/{args.epochs} | train loss {train_loss:.4f} | "
-                f"val loss {val_loss:.4f} | val acc {val_acc:.2%}"
-            )
+        model = build_model(len(feature_columns), hidden_sizes, args.dropout).to(device)
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_state = copy.deepcopy(model.state_dict())
+        # Inverse-frequency positive-class weight, since ~62% of passengers did not survive.
+        pos_weight = torch.tensor([(y_train == 0).sum() / max((y_train == 1).sum(), 1)], device=device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=8)
+
+        best_val_acc = -1.0
+        best_state = None
+
+        for _epoch in range(1, args.epochs + 1):
+            model.train()
+            for xb, yb in train_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                optimizer.zero_grad()
+                logits = model(xb).squeeze(1)
+                loss = criterion(logits, yb)
+                loss.backward()
+                optimizer.step()
+
+            val_acc, _ = evaluate(model, val_x, val_y, criterion)
+            scheduler.step(val_acc)
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_state = copy.deepcopy(model.state_dict())
+
+        model.load_state_dict(best_state)
+        model.eval()
+        with torch.inference_mode():
+            oof_probabilities[val_idx] = torch.sigmoid(model(val_x).squeeze(1)).cpu().numpy()
+
+        print(f"Fold {fold_idx}/{args.n_folds} | best val acc {best_val_acc:.2%}")
+        fold_accuracies.append(best_val_acc)
+        fold_checkpoints.append(
+            {
+                "model_state_dict": best_state,
+                "numeric_mean": mean.tolist(),
+                "numeric_std": std.tolist(),
+            }
+        )
+
+    cv_mean_accuracy = float(np.mean(fold_accuracies))
+    cv_std_accuracy = float(np.std(fold_accuracies))
+    oof_accuracy = float(((oof_probabilities >= 0.5) == y_all).mean())
 
     checkpoint = {
-        "model_state_dict": best_state,
+        "folds": fold_checkpoints,
         "hidden_sizes": hidden_sizes,
         "dropout": args.dropout,
         "feature_columns": feature_columns,
         "categorical_values": CATEGORICAL_VALUES,
         "numeric_columns": NUMERIC_COLUMNS,
-        "numeric_mean": mean.tolist(),
-        "numeric_std": std.tolist(),
         **imputers,
-        "best_val_accuracy": best_val_acc,
+        "cv_mean_accuracy": cv_mean_accuracy,
+        "cv_std_accuracy": cv_std_accuracy,
+        "oof_accuracy": oof_accuracy,
+        "best_val_accuracy": oof_accuracy,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, args.output)
-    print(f"\nBest validation accuracy: {best_val_acc:.2%}")
+    print(f"\nPer-fold accuracy: {cv_mean_accuracy:.2%} +/- {cv_std_accuracy:.2%} (mean +/- std over {args.n_folds} folds)")
+    print(f"Out-of-fold accuracy (unbiased, whole-dataset): {oof_accuracy:.2%}")
     print(f"Model saved to: {args.output}")
 
 
