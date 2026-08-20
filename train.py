@@ -47,7 +47,10 @@ CATEGORICAL_VALUES: dict[str, list[Any]] = {
     "Embarked": ["C", "Q", "S"],
     "Title": KNOWN_TITLES + [RARE_TITLE],
 }
-NUMERIC_COLUMNS = ["Age", "Fare", "FamilySize"]
+# FamilySurvivalRate is a placeholder here (filled in per-fold, leave-one-out, inside
+# train() -- see compute_family_survival_rate -- since it must never leak validation
+# labels into a fold's training features.
+NUMERIC_COLUMNS = ["Age", "Fare", "FamilySize", "FamilySurvivalRate"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--n_folds", type=int, default=5, help="Number of stratified CV folds.")
     parser.add_argument("--hidden_sizes", type=str, default="32,16", help="Comma-separated hidden layer sizes.")
     parser.add_argument("--seed", type=int, default=42)
@@ -130,6 +133,35 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(parts, axis=1)
 
 
+def compute_family_survival_rate(
+    tickets: np.ndarray, y_all: np.ndarray, train_idx: np.ndarray, target_idx: np.ndarray, fallback_rate: float
+) -> np.ndarray:
+    """Mean Survived among other passengers sharing a Ticket, using only train-fold rows.
+
+    For rows in target_idx that are themselves in train_idx, the row's own label is
+    excluded (leave-one-out) so a passenger's feature never encodes their own outcome.
+    Groups with no train-fold groupmates fall back to the fold's overall survival rate.
+    """
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for idx in train_idx:
+        ticket = str(tickets[idx])
+        sums[ticket] = sums.get(ticket, 0.0) + float(y_all[idx])
+        counts[ticket] = counts.get(ticket, 0) + 1
+
+    train_idx_set = set(train_idx.tolist())
+    rates = np.empty(len(target_idx), dtype=np.float32)
+    for pos, idx in enumerate(target_idx):
+        ticket = str(tickets[idx])
+        total = counts.get(ticket, 0)
+        total_sum = sums.get(ticket, 0.0)
+        if idx in train_idx_set:
+            total -= 1
+            total_sum -= y_all[idx]
+        rates[pos] = (total_sum / total) if total > 0 else fallback_rate
+    return rates
+
+
 def build_model(input_dim: int, hidden_sizes: list[int], dropout: float) -> nn.Module:
     layers: list[nn.Module] = []
     in_features = input_dim
@@ -161,14 +193,17 @@ def train(args: argparse.Namespace) -> None:
     raw = engineer_raw_columns(load_raw(args.data))
     imputers = fit_imputers(raw)
     raw = apply_imputers(raw, imputers)
+    raw["FamilySurvivalRate"] = 0.0  # placeholder, overwritten per-fold below
 
     features = build_features(raw)
     feature_columns = list(features.columns)
     x_all = features.to_numpy(dtype=np.float32)
     y_all = raw["Survived"].astype(np.float32).to_numpy()
+    tickets = raw["Ticket"].astype(str).to_numpy()
 
     hidden_sizes = [int(size) for size in args.hidden_sizes.split(",") if size]
     numeric_slice = slice(0, len(NUMERIC_COLUMNS))
+    family_rate_col = NUMERIC_COLUMNS.index("FamilySurvivalRate")
 
     skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
     fold_checkpoints: list[dict[str, Any]] = []
@@ -180,6 +215,10 @@ def train(args: argparse.Namespace) -> None:
     for fold_idx, (train_idx, val_idx) in enumerate(skf.split(x_all, y_all), start=1):
         x_train, x_val = x_all[train_idx].copy(), x_all[val_idx].copy()
         y_train, y_val = y_all[train_idx], y_all[val_idx]
+
+        fallback_rate = float(y_train.mean())
+        x_train[:, family_rate_col] = compute_family_survival_rate(tickets, y_all, train_idx, train_idx, fallback_rate)
+        x_val[:, family_rate_col] = compute_family_survival_rate(tickets, y_all, train_idx, val_idx, fallback_rate)
 
         mean = x_train[:, numeric_slice].mean(axis=0)
         std = x_train[:, numeric_slice].std(axis=0)
@@ -238,12 +277,16 @@ def train(args: argparse.Namespace) -> None:
                 "model_state_dict": best_state,
                 "numeric_mean": mean.tolist(),
                 "numeric_std": std.tolist(),
+                "family_survival_fallback": fallback_rate,
             }
         )
 
     cv_mean_accuracy = float(np.mean(fold_accuracies))
     cv_std_accuracy = float(np.std(fold_accuracies))
     oof_accuracy = float(((oof_probabilities >= 0.5) == y_all).mean())
+    eps = 1e-7
+    clipped = np.clip(oof_probabilities, eps, 1 - eps)
+    oof_loss = float(-np.mean(y_all * np.log(clipped) + (1 - y_all) * np.log(1 - clipped)))
 
     checkpoint: dict[str, Any] = {
         "folds": fold_checkpoints,
@@ -256,12 +299,14 @@ def train(args: argparse.Namespace) -> None:
         "cv_mean_accuracy": cv_mean_accuracy,
         "cv_std_accuracy": cv_std_accuracy,
         "oof_accuracy": oof_accuracy,
+        "oof_loss": oof_loss,
         "best_val_accuracy": oof_accuracy,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, args.output)
     print(f"\nPer-fold accuracy: {cv_mean_accuracy:.2%} +/- {cv_std_accuracy:.2%} (mean +/- std over {args.n_folds} folds)")
     print(f"Out-of-fold accuracy (unbiased, whole-dataset): {oof_accuracy:.2%}")
+    print(f"Out-of-fold loss (binary cross-entropy): {oof_loss:.4f}")
     print(f"Model saved to: {args.output}")
 
 
