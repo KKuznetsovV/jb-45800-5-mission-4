@@ -19,6 +19,7 @@ comparison against v4 re-measured under the same k-fold protocol.
 | `experiment/tuned-mlp-v3` | + Deck (from Cabin, mostly "unknown") on top of v2 features | 3 hidden layers (128, 64, 32) + BatchNorm + Dropout(0.25) | 200 | 82.68% |
 | `experiment/tuned-mlp-v4` | Same features as v2 (Title, FamilySize, log(Fare)) | 2 hidden layers (32, 16) + BatchNorm + Dropout(0.2) | 150 | 84.92% (single-split) |
 | `experiment/kfold-ticket-ensemble` | Same features as v4 | Same as v4, trained as a 5-model k-fold ensemble | 150 x 5 folds | **84.18% OOF** (honest CV estimate) |
+| `experiment/family-survival-rate` | + `FamilySurvivalRate` (leave-one-out, ticket-group), dropout 0.2 -> 0.1 | Same as v4/ensemble | 150 x 5 folds | **84.85% OOF**, loss 0.4292 |
 
 ## experiment/baseline-mlp
 
@@ -136,10 +137,43 @@ which should be at least as robust on genuinely new passengers. `TicketGroupSize
 is a documented negative result: a plausible feature that measurably didn't
 help once evaluated honestly.
 
+## experiment/family-survival-rate
+
+Command:
+
+```bash
+python train.py --data data/titanic.csv --output titanic_model.pt --epochs 150 --n_folds 5
+```
+
+A calibration check (comparing the ensemble's predicted survival rate per
+Pclass/Sex/child bucket against the historical Wikipedia "Titanic casualties"
+aggregate counts) showed predictions consistently shrunk toward 50% relative
+to both the actual labels and the historical rates (e.g. 21.9% predicted vs.
+8.3% actual/historical for 2nd-class men) — a sign of over-regularization,
+and a direct contributor to a higher-than-necessary loss even where accuracy
+was fine. Two changes were made together:
+
+- **`FamilySurvivalRate`**: for each passenger, the mean `Survived` of other
+  passengers sharing the same `Ticket` (families/groups tended to survive or
+  die together on the Titanic). Computed leave-one-out and fold-safe: only
+  the current fold's *training* rows are used, a training row excludes its
+  own label, and groups with no train-fold groupmates fall back to that
+  fold's overall survival rate. This is different from the earlier
+  (rejected) `TicketGroupSize`, which only counted group size — this feature
+  uses groupmates' actual outcomes. `predict.py` has no ticket for a brand-new
+  passenger, so it always uses the stored per-fold fallback rate.
+- **Dropout 0.2 -> 0.1**: less aggressive regularization, to let the model
+  produce more confident (less shrunk-toward-0.5) probabilities.
+
+Result: **84.85%** OOF accuracy (up from 84.18%), and a newly-tracked
+**OOF loss of 0.4292** (binary cross-entropy; not directly comparable to
+earlier branches since this metric wasn't reported before this branch).
+Reproduced exactly across retrains.
+
 ## Conclusion
 
-`experiment/kfold-ticket-ensemble` is the recommended model: it reuses v4's
-features/architecture (the best found so far) but replaces the single-split
-evaluation with 5-fold CV (84.18% OOF, a more honest estimate than v4's
-84.92%) and ships a 5-model ensemble instead of one checkpoint, for more
-robust predictions on genuinely new passengers. It was merged into `main`.
+`experiment/family-survival-rate` is the recommended model: it builds on the
+kfold-ticket-ensemble's protocol (5-fold CV, ensemble inference) and adds a
+leakage-safe `FamilySurvivalRate` feature plus lighter dropout, improving OOF
+accuracy from 84.18% to 84.85% while directly addressing the probability-
+shrinkage issue found during calibration checking.

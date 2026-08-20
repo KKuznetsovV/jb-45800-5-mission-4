@@ -91,7 +91,11 @@ def extract_title(name: str | None, sex: str, age: float) -> str:
 
 
 def build_feature_vector(
-    args: argparse.Namespace, checkpoint: dict[str, Any], mean: list[float], std: list[float]
+    args: argparse.Namespace,
+    checkpoint: dict[str, Any],
+    mean: list[float],
+    std: list[float],
+    family_survival_rate: float,
 ) -> torch.Tensor:
     title = extract_title(args.name, args.sex, args.age)
     family_size = args.sibsp + args.parch + 1
@@ -101,6 +105,9 @@ def build_feature_vector(
         "Age": args.age,
         "Fare": float(np.log1p(args.fare)),
         "FamilySize": float(family_size),
+        # No ticket is known for a brand-new passenger, so we can't tell whether any
+        # travel companions survived -- fall back to this fold's overall survival rate.
+        "FamilySurvivalRate": family_survival_rate,
     }
     values: list[float] = [
         (raw_numeric[column] - mean[i]) / std[i] for i, column in enumerate(numeric_columns)
@@ -132,7 +139,9 @@ def predict(args: argparse.Namespace) -> tuple[float, int]:
         model.load_state_dict(fold["model_state_dict"])
         model.eval()
 
-        features = build_feature_vector(args, checkpoint, fold["numeric_mean"], fold["numeric_std"]).to(device)
+        features = build_feature_vector(
+            args, checkpoint, fold["numeric_mean"], fold["numeric_std"], fold["family_survival_fallback"]
+        ).to(device)
         with torch.inference_mode():
             logit = model(features).squeeze(1)
             probabilities.append(torch.sigmoid(logit).item())
