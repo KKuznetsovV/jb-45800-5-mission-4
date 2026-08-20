@@ -29,7 +29,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import StratifiedKFold
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -50,7 +51,9 @@ CATEGORICAL_VALUES: dict[str, list[Any]] = {
 # FamilySurvivalRate is a placeholder here (filled in per-fold, leave-one-out, inside
 # train() -- see compute_family_survival_rate -- since it must never leak validation
 # labels into a fold's training features.
-NUMERIC_COLUMNS = ["Age", "Fare", "FamilySize", "FamilySurvivalRate"]
+NUMERIC_COLUMNS = ["Age", "Fare", "FamilySize", "HasCabin", "FamilySurvivalRate"]
+# Features used by the Age regression imputer (see fit_imputers/apply_imputers).
+AGE_MODEL_COLUMNS = ["Pclass", "SexMale", "FamilySize"] + [f"Title_{t}" for t in KNOWN_TITLES + [RARE_TITLE]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,6 +66,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--n_folds", type=int, default=5, help="Number of stratified CV folds.")
+    parser.add_argument(
+        "--n_repeats",
+        type=int,
+        default=1,
+        help="Repeats of the n_folds split with different shuffles, averaged into the OOF estimate "
+        "(reduces OOF noise for comparing configs; 1 reproduces the plain single k-fold run).",
+    )
     parser.add_argument("--hidden_sizes", type=str, default="32,16", help="Comma-separated hidden layer sizes.")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -87,19 +97,34 @@ def extract_title(name: str) -> str:
 
 
 def engineer_raw_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Add Title/FamilySize columns derived from the raw Kaggle columns."""
+    """Add Title/FamilySize/HasCabin columns derived from the raw Kaggle columns."""
     df = df.copy()
     df["Title"] = df["Name"].map(extract_title)
     df["FamilySize"] = df["SibSp"].fillna(0) + df["Parch"].fillna(0) + 1
+    df["HasCabin"] = df["Cabin"].notna().astype(float)
     return df
 
 
+def build_age_features(df: pd.DataFrame) -> pd.DataFrame:
+    parts: dict[str, Any] = {
+        "Pclass": df["Pclass"].astype(float),
+        "SexMale": (df["Sex"] == "male").astype(float),
+        "FamilySize": df["FamilySize"].astype(float),
+    }
+    for title in KNOWN_TITLES + [RARE_TITLE]:
+        parts[f"Title_{title}"] = (df["Title"] == title).astype(float)
+    return pd.DataFrame(parts)[AGE_MODEL_COLUMNS]
+
+
 def fit_imputers(df: pd.DataFrame) -> dict[str, Any]:
-    age_by_title = df.groupby("Title")["Age"].median().to_dict()
+    known_age = df[df["Age"].notna()]
+    age_model = LinearRegression()
+    age_model.fit(build_age_features(known_age), known_age["Age"])
+
     fare_by_pclass = df.groupby("Pclass")["Fare"].median().to_dict()
     return {
-        "age_median_by_title": {str(k): float(v) for k, v in age_by_title.items()},
-        "age_median_overall": float(df["Age"].median()),
+        "age_model_coef": age_model.coef_.tolist(),
+        "age_model_intercept": float(age_model.intercept_),
         "fare_median_by_pclass": {int(str(k)): float(v) for k, v in fare_by_pclass.items()},
         "fare_median_overall": float(df["Fare"].median()),
         "embarked_mode": str(df["Embarked"].mode(dropna=True).iloc[0]),
@@ -108,11 +133,14 @@ def fit_imputers(df: pd.DataFrame) -> dict[str, Any]:
 
 def apply_imputers(df: pd.DataFrame, imputers: dict[str, Any]) -> pd.DataFrame:
     df = df.copy()
-    age_by_title: dict[str, float] = imputers["age_median_by_title"]
     fare_by_pclass: dict[int, float] = imputers["fare_median_by_pclass"]
 
-    age_fallback = df["Title"].map(age_by_title).fillna(imputers["age_median_overall"])
-    df["Age"] = df["Age"].fillna(age_fallback)
+    coef = np.array(imputers["age_model_coef"], dtype=np.float64)
+    intercept = float(imputers["age_model_intercept"])
+    # Ages can't be negative; a linear model can predict slightly below 0 for very
+    # young/large-family combinations, so clip to a plausible minimum.
+    predicted_age = np.clip(build_age_features(df).to_numpy(dtype=np.float64) @ coef + intercept, 0.5, None)
+    df["Age"] = df["Age"].fillna(pd.Series(predicted_age, index=df.index))
 
     fare_fallback = df["Pclass"].map(fare_by_pclass).fillna(imputers["fare_median_overall"])
     df["Fare"] = df["Fare"].fillna(fare_fallback)
@@ -205,14 +233,25 @@ def train(args: argparse.Namespace) -> None:
     numeric_slice = slice(0, len(NUMERIC_COLUMNS))
     family_rate_col = NUMERIC_COLUMNS.index("FamilySurvivalRate")
 
-    skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
+    # n_repeats=1 (the default) uses plain StratifiedKFold so the standard run stays
+    # bit-for-bit reproducible with earlier branches; n_repeats>1 reruns the k-fold split
+    # with different shuffles and averages each row's predictions, for a lower-noise OOF
+    # estimate when comparing configs (it doesn't change how the deployed model predicts).
+    if args.n_repeats > 1:
+        splitter = RepeatedStratifiedKFold(n_splits=args.n_folds, n_repeats=args.n_repeats, random_state=args.seed)
+    else:
+        splitter = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
+    total_folds = args.n_folds * args.n_repeats
+
     fold_checkpoints: list[dict[str, Any]] = []
     fold_accuracies: list[float] = []
-    # Out-of-fold predictions: each row is predicted exactly once, by a model
-    # that never saw it during training, giving an unbiased accuracy estimate.
-    oof_probabilities = np.zeros_like(y_all)
+    # Out-of-fold predictions: with n_repeats=1 each row is predicted exactly once, by a
+    # model that never saw it during training; with n_repeats>1 each row is predicted once
+    # per repeat and the repeats are averaged, giving a lower-variance unbiased estimate.
+    oof_probabilities_sum = np.zeros_like(y_all)
+    oof_counts = np.zeros_like(y_all)
 
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(x_all, y_all), start=1):
+    for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(x_all, y_all), start=1):
         x_train, x_val = x_all[train_idx].copy(), x_all[val_idx].copy()
         y_train, y_val = y_all[train_idx], y_all[val_idx]
 
@@ -268,9 +307,10 @@ def train(args: argparse.Namespace) -> None:
         model.load_state_dict(best_state)
         model.eval()
         with torch.inference_mode():
-            oof_probabilities[val_idx] = torch.sigmoid(model(val_x).squeeze(1)).cpu().numpy()
+            oof_probabilities_sum[val_idx] += torch.sigmoid(model(val_x).squeeze(1)).cpu().numpy()
+            oof_counts[val_idx] += 1
 
-        print(f"Fold {fold_idx}/{args.n_folds} | best val acc {best_val_acc:.2%}")
+        print(f"Fold {fold_idx}/{total_folds} | best val acc {best_val_acc:.2%}")
         fold_accuracies.append(best_val_acc)
         fold_checkpoints.append(
             {
@@ -283,6 +323,7 @@ def train(args: argparse.Namespace) -> None:
 
     cv_mean_accuracy = float(np.mean(fold_accuracies))
     cv_std_accuracy = float(np.std(fold_accuracies))
+    oof_probabilities = oof_probabilities_sum / oof_counts
     oof_accuracy = float(((oof_probabilities >= 0.5) == y_all).mean())
     eps = 1e-7
     clipped = np.clip(oof_probabilities, eps, 1 - eps)
@@ -304,7 +345,7 @@ def train(args: argparse.Namespace) -> None:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, args.output)
-    print(f"\nPer-fold accuracy: {cv_mean_accuracy:.2%} +/- {cv_std_accuracy:.2%} (mean +/- std over {args.n_folds} folds)")
+    print(f"\nPer-fold accuracy: {cv_mean_accuracy:.2%} +/- {cv_std_accuracy:.2%} (mean +/- std over {total_folds} folds)")
     print(f"Out-of-fold accuracy (unbiased, whole-dataset): {oof_accuracy:.2%}")
     print(f"Out-of-fold loss (binary cross-entropy): {oof_loss:.4f}")
     print(f"Model saved to: {args.output}")

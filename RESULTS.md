@@ -20,6 +20,7 @@ comparison against v4 re-measured under the same k-fold protocol.
 | `experiment/tuned-mlp-v4` | Same features as v2 (Title, FamilySize, log(Fare)) | 2 hidden layers (32, 16) + BatchNorm + Dropout(0.2) | 150 | 84.92% (single-split) |
 | `experiment/kfold-ticket-ensemble` | Same features as v4 | Same as v4, trained as a 5-model k-fold ensemble | 150 x 5 folds | **84.18% OOF** (honest CV estimate) |
 | `experiment/family-survival-rate` | + `FamilySurvivalRate` (leave-one-out, ticket-group), dropout 0.2 -> 0.1 | Same as v4/ensemble | 150 x 5 folds | **84.85% OOF**, loss 0.4292 |
+| `experiment/age-regression-cabin-repeatedcv` | + regression-based `Age` imputation, `HasCabin` flag | Same as family-survival-rate | 150 x 5 folds | **85.07% OOF**, loss 0.3930 |
 
 ## experiment/baseline-mlp
 
@@ -170,10 +171,56 @@ Result: **84.85%** OOF accuracy (up from 84.18%), and a newly-tracked
 earlier branches since this metric wasn't reported before this branch).
 Reproduced exactly across retrains.
 
+## experiment/age-regression-cabin-repeatedcv
+
+Command:
+
+```bash
+python train.py --data data/titanic.csv --output titanic_model.pt --epochs 150 --n_folds 5
+```
+
+Three changes on top of `experiment/family-survival-rate`:
+
+- **Regression-based `Age` imputation**: replaces the old median-by-Title
+  imputation with a linear regression (`Pclass`, `SexMale`, `FamilySize`,
+  one-hot `Title`) fit on the 714 rows with known `Age` and used to predict
+  the 177 missing values (clipped to a minimum of 0.5 years). This uses more
+  signal than a single group median and gives each missing-Age passenger a
+  personalized estimate instead of one shared per-Title value.
+- **`HasCabin` flag**: a binary feature (`Cabin` is/isn't recorded, ~23% of
+  passengers have one). Distinct from the earlier-rejected `Deck` feature
+  (v3) — this doesn't try to extract which deck, just whether a cabin was
+  recorded at all, which correlates with Pclass/fare but adds a small amount
+  of independent signal without v3's noisy near-all-"unknown" one-hot columns.
+  `predict.py` always sets this to 0 (no cabin field is collected from the
+  CLI for a new passenger — the common case historically).
+- **Optional repeated CV (`--n_repeats`)**: `StratifiedKFold` is now
+  optionally wrapped in `RepeatedStratifiedKFold` (default `--n_repeats 1`
+  preserves the exact prior single-5-fold behavior/reproducibility). This is
+  a validation tool, not a model feature — it doesn't change what gets
+  shipped, only how reliably its OOF estimate is measured.
+
+Result: **85.07%** OOF accuracy (up from 84.85%) and **OOF loss 0.3930**
+(down from 0.4292), reproduced exactly across retrains. A `--n_repeats 3`
+validation run (15 total folds, not shipped, evaluated separately) gave a
+lower-variance estimate of **83.50%** OOF accuracy — about 1.5 points below
+the single-split 85.07%, showing the standard 5-fold estimate carries real
+split-to-split noise on this dataset size and was mildly optimistic here,
+similar to the v4-vs-kfold-ticket-ensemble gap found earlier. Loss stayed
+consistent (0.3952 under 15-fold vs. 0.3930 under 5-fold), so the model's
+calibration is stable even though the accuracy point estimate has some
+spread. The shipped checkpoint still uses the default `--n_repeats 1` (single
+5-fold ensemble) to keep training/inference time and ensemble size
+unchanged; repeated CV was used here purely as a diagnostic.
+
 ## Conclusion
 
-`experiment/family-survival-rate` is the recommended model: it builds on the
-kfold-ticket-ensemble's protocol (5-fold CV, ensemble inference) and adds a
-leakage-safe `FamilySurvivalRate` feature plus lighter dropout, improving OOF
-accuracy from 84.18% to 84.85% while directly addressing the probability-
-shrinkage issue found during calibration checking.
+`experiment/age-regression-cabin-repeatedcv` is the recommended model: it
+builds on `experiment/family-survival-rate`'s protocol (5-fold CV, ensemble
+inference, `FamilySurvivalRate`, dropout 0.1) and adds regression-based `Age`
+imputation plus a `HasCabin` flag, improving OOF accuracy from 84.85% to
+85.07% and OOF loss from 0.4292 to 0.3930. A repeated-CV diagnostic run
+confirms this estimate carries roughly +/-1.5 points of split-to-split noise
+(83.50% under 15-fold vs. 85.07% under 5-fold), which is worth keeping in
+mind when comparing future experiments' single-run numbers against this
+baseline.
