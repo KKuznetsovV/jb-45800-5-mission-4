@@ -19,8 +19,10 @@ pip install -r requirements.txt
 python train.py --data data/titanic.csv --output titanic_model.pt --epochs 60
 ```
 
-Prints per-epoch train/val loss and accuracy, and saves the best checkpoint
-(model weights + all preprocessing statistics needed for inference) to `--output`.
+Trains 5 models via stratified k-fold cross-validation, prints each fold's
+best validation accuracy plus an overall out-of-fold accuracy, and saves a
+checkpoint bundling all 5 folds (weights + preprocessing statistics needed
+for inference) to `--output`.
 
 ## Predict (foreign / unseen input)
 
