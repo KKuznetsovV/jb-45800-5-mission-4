@@ -105,6 +105,9 @@ def build_feature_vector(
         "Age": args.age,
         "Fare": float(np.log1p(args.fare)),
         "FamilySize": float(family_size),
+        # No cabin field is collected from the CLI, so assume none is known -- the
+        # common case historically, especially outside 1st class.
+        "HasCabin": 0.0,
         # No ticket is known for a brand-new passenger, so we can't tell whether any
         # travel companions survived -- fall back to this fold's overall survival rate.
         "FamilySurvivalRate": family_survival_rate,
