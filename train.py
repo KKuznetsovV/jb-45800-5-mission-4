@@ -154,7 +154,7 @@ def evaluate(model: nn.Module, x: torch.Tensor, y: torch.Tensor, criterion: nn.M
 
 
 def train(args: argparse.Namespace) -> None:
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.seed)  # type: ignore[reportUnknownMemberType]
     device = choose_device()
     print(f"Device: {device}")
 
@@ -188,12 +188,12 @@ def train(args: argparse.Namespace) -> None:
         x_val[:, numeric_slice] = (x_val[:, numeric_slice] - mean) / std
 
         train_loader = DataLoader(
-            TensorDataset(torch.from_numpy(x_train), torch.from_numpy(y_train)),
+            TensorDataset(torch.from_numpy(x_train), torch.from_numpy(y_train)),  # type: ignore[reportUnknownMemberType]
             batch_size=args.batch_size,
             shuffle=True,
         )
-        val_x = torch.from_numpy(x_val).to(device)
-        val_y = torch.from_numpy(y_val).to(device)
+        val_x = torch.from_numpy(x_val).to(device)  # type: ignore[reportUnknownMemberType]
+        val_y = torch.from_numpy(y_val).to(device)  # type: ignore[reportUnknownMemberType]
 
         model = build_model(len(feature_columns), hidden_sizes, args.dropout).to(device)
 
@@ -214,10 +214,10 @@ def train(args: argparse.Namespace) -> None:
                 logits = model(xb).squeeze(1)
                 loss = criterion(logits, yb)
                 loss.backward()
-                optimizer.step()
+                optimizer.step()  # type: ignore[reportUnknownMemberType]
 
             val_acc, _ = evaluate(model, val_x, val_y, criterion)
-            scheduler.step(val_acc)
+            scheduler.step(val_acc)  # type: ignore[reportUnknownMemberType]
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
