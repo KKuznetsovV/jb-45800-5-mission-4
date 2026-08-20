@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -55,7 +56,7 @@ def choose_device() -> torch.device:
     return torch.device("cpu")
 
 
-def load_checkpoint(path: Path, device: torch.device) -> dict:
+def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"Model checkpoint not found: {path}")
     try:
@@ -89,22 +90,30 @@ def extract_title(name: str | None, sex: str, age: float) -> str:
     return "Miss" if age < 15 else "Mrs"
 
 
-def build_feature_vector(args: argparse.Namespace, checkpoint: dict, mean: list[float], std: list[float]) -> torch.Tensor:
+def build_feature_vector(
+    args: argparse.Namespace, checkpoint: dict[str, Any], mean: list[float], std: list[float]
+) -> torch.Tensor:
     title = extract_title(args.name, args.sex, args.age)
     family_size = args.sibsp + args.parch + 1
 
-    numeric_columns = checkpoint["numeric_columns"]
-    raw_numeric = {
+    numeric_columns: list[str] = checkpoint["numeric_columns"]
+    raw_numeric: dict[str, float] = {
         "Age": args.age,
         "Fare": float(np.log1p(args.fare)),
         "FamilySize": float(family_size),
     }
-    values = [
+    values: list[float] = [
         (raw_numeric[column] - mean[i]) / std[i] for i, column in enumerate(numeric_columns)
     ]
 
-    raw_categorical = {"Pclass": args.pclass, "Sex": args.sex, "Embarked": args.embarked, "Title": title}
-    for column, allowed_values in checkpoint["categorical_values"].items():
+    raw_categorical: dict[str, Any] = {
+        "Pclass": args.pclass,
+        "Sex": args.sex,
+        "Embarked": args.embarked,
+        "Title": title,
+    }
+    categorical_values: dict[str, list[Any]] = checkpoint["categorical_values"]
+    for column, allowed_values in categorical_values.items():
         actual = raw_categorical[column]
         values.extend(1.0 if actual == value else 0.0 for value in allowed_values)
 
@@ -115,7 +124,7 @@ def predict(args: argparse.Namespace) -> tuple[float, int]:
     device = choose_device()
     checkpoint = load_checkpoint(args.model, device)
 
-    probabilities = []
+    probabilities: list[float] = []
     for fold in checkpoint["folds"]:
         model = build_model(
             len(checkpoint["feature_columns"]), checkpoint["hidden_sizes"], checkpoint["dropout"]

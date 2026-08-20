@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import copy
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -40,7 +41,7 @@ TITLE_MAP = {
 KNOWN_TITLES = ["Master", "Miss", "Mr", "Mrs"]
 RARE_TITLE = "Rare"
 
-CATEGORICAL_VALUES = {
+CATEGORICAL_VALUES: dict[str, list[Any]] = {
     "Pclass": [1, 2, 3],
     "Sex": ["female", "male"],
     "Embarked": ["C", "Q", "S"],
@@ -90,35 +91,29 @@ def engineer_raw_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fit_imputers(df: pd.DataFrame) -> dict:
+def fit_imputers(df: pd.DataFrame) -> dict[str, Any]:
     age_by_title = df.groupby("Title")["Age"].median().to_dict()
     fare_by_pclass = df.groupby("Pclass")["Fare"].median().to_dict()
     return {
-        "age_median_by_title": {k: float(v) for k, v in age_by_title.items()},
+        "age_median_by_title": {str(k): float(v) for k, v in age_by_title.items()},
         "age_median_overall": float(df["Age"].median()),
-        "fare_median_by_pclass": {int(k): float(v) for k, v in fare_by_pclass.items()},
+        "fare_median_by_pclass": {int(str(k)): float(v) for k, v in fare_by_pclass.items()},
         "fare_median_overall": float(df["Fare"].median()),
         "embarked_mode": str(df["Embarked"].mode(dropna=True).iloc[0]),
     }
 
 
-def apply_imputers(df: pd.DataFrame, imputers: dict) -> pd.DataFrame:
+def apply_imputers(df: pd.DataFrame, imputers: dict[str, Any]) -> pd.DataFrame:
     df = df.copy()
-    age_by_title = imputers["age_median_by_title"]
-    fare_by_pclass = imputers["fare_median_by_pclass"]
+    age_by_title: dict[str, float] = imputers["age_median_by_title"]
+    fare_by_pclass: dict[int, float] = imputers["fare_median_by_pclass"]
 
-    df["Age"] = df.apply(
-        lambda row: age_by_title.get(row["Title"], imputers["age_median_overall"])
-        if pd.isna(row["Age"])
-        else row["Age"],
-        axis=1,
-    )
-    df["Fare"] = df.apply(
-        lambda row: fare_by_pclass.get(row["Pclass"], imputers["fare_median_overall"])
-        if pd.isna(row["Fare"])
-        else row["Fare"],
-        axis=1,
-    )
+    age_fallback = df["Title"].map(age_by_title).fillna(imputers["age_median_overall"])
+    df["Age"] = df["Age"].fillna(age_fallback)
+
+    fare_fallback = df["Pclass"].map(fare_by_pclass).fillna(imputers["fare_median_overall"])
+    df["Fare"] = df["Fare"].fillna(fare_fallback)
+
     df["Embarked"] = df["Embarked"].fillna(imputers["embarked_mode"])
     return df
 
@@ -176,8 +171,8 @@ def train(args: argparse.Namespace) -> None:
     numeric_slice = slice(0, len(NUMERIC_COLUMNS))
 
     skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
-    fold_checkpoints = []
-    fold_accuracies = []
+    fold_checkpoints: list[dict[str, Any]] = []
+    fold_accuracies: list[float] = []
     # Out-of-fold predictions: each row is predicted exactly once, by a model
     # that never saw it during training, giving an unbiased accuracy estimate.
     oof_probabilities = np.zeros_like(y_all)
@@ -209,7 +204,7 @@ def train(args: argparse.Namespace) -> None:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=8)
 
         best_val_acc = -1.0
-        best_state = None
+        best_state: dict[str, Any] | None = None
 
         for _epoch in range(1, args.epochs + 1):
             model.train()
@@ -227,6 +222,9 @@ def train(args: argparse.Namespace) -> None:
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_state = copy.deepcopy(model.state_dict())
+
+        if best_state is None:
+            raise RuntimeError(f"Fold {fold_idx} never improved past the initial accuracy; check --epochs.")
 
         model.load_state_dict(best_state)
         model.eval()
@@ -247,7 +245,7 @@ def train(args: argparse.Namespace) -> None:
     cv_std_accuracy = float(np.std(fold_accuracies))
     oof_accuracy = float(((oof_probabilities >= 0.5) == y_all).mean())
 
-    checkpoint = {
+    checkpoint: dict[str, Any] = {
         "folds": fold_checkpoints,
         "hidden_sizes": hidden_sizes,
         "dropout": args.dropout,
