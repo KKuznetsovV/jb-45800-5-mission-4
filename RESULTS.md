@@ -9,6 +9,7 @@ accuracy achieved during training.
 | `experiment/baseline-mlp` | Raw columns (Pclass, Sex, Age, SibSp, Parch, Fare, Embarked), median/mode imputation | 1 hidden layer (16 units) | 20 | 79.89% |
 | `experiment/tuned-mlp-v2` | + Title (from name), FamilySize, log(Fare), group-wise median imputation, class-weighted loss | 2 hidden layers (64, 32) + BatchNorm + Dropout(0.3) | 150 | **84.36%** |
 | `experiment/tuned-mlp-v3` | + Deck (from Cabin, mostly "unknown") on top of v2 features | 3 hidden layers (128, 64, 32) + BatchNorm + Dropout(0.25) | 200 | 82.68% |
+| `experiment/tuned-mlp-v4` | Same features as v2 (Title, FamilySize, log(Fare)) | 2 hidden layers (32, 16) + BatchNorm + Dropout(0.2) | 150 | **84.92%** |
 
 ## experiment/baseline-mlp
 
@@ -63,7 +64,31 @@ larger network overfits the small (891-row) dataset instead of generalizing
 better. This confirms bigger/more isn't automatically better for this
 dataset size.
 
+## experiment/tuned-mlp-v4
+
+Command:
+
+```bash
+python train.py --data data/titanic.csv --output titanic_model.pt --epochs 150 --hidden_sizes 32,16 --dropout 0.2
+```
+
+Tried on top of v2's feature set (raw `Fare`, no `Deck`):
+- `FarePerPerson` (`Fare / FamilySize`) instead of raw `Fare`: **83.80%** — worse.
+- Adding an explicit `IsAlone` flag alongside `FamilySize`/`Fare`: **84.36%** — no
+  change (redundant with `FamilySize`, the network already learns this boundary).
+- Shrinking the network from v2's (64, 32) to (32, 16) with less dropout
+  (0.3 -> 0.2), same v2 features, same 150 epochs: **84.92%** — best result so far.
+- Further shrinking to a single 32-unit layer: also 84.92% (tied).
+- Widening back out with 200 epochs and dropout 0.15: 83.80% — worse.
+
+Result: **84.92%** validation accuracy with a *smaller* (32, 16) network and
+lighter dropout than v2, using the exact same features as v2. On a dataset
+this small (891 rows), extra engineered features and a bigger network both
+tended to overfit rather than help; the win came from reducing model capacity
+to match the amount of training data. This is the best result across all
+branches and was merged into `main`.
+
 ## Conclusion
 
-`experiment/tuned-mlp-v2` has the best validation accuracy (84.36%) and was
+`experiment/tuned-mlp-v4` has the best validation accuracy (84.92%) and was
 merged into `main`.

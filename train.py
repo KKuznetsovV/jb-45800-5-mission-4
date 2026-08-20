@@ -4,13 +4,13 @@ train.py
 
 Train a PyTorch MLP to predict Titanic passenger survival.
 
-Tuned v2: adds engineered features (title extracted from name, family size,
-is-alone flag), group-wise median imputation, a log-fare transform, and a
-deeper regularized network trained for more epochs than the baseline.
+Tuned v4: same engineered features as v2 (title extracted from name, family
+size, log-fare transform, group-wise median imputation) but a smaller,
+lighter-regularized network, which generalizes better on this small dataset.
 
 Usage:
     python train.py --data data/titanic.csv --output titanic_model.pt
-    python train.py --data data/titanic.csv --epochs 150 --hidden_sizes 64,32
+    python train.py --data data/titanic.csv --epochs 150 --hidden_sizes 32,16
 """
 
 from __future__ import annotations
@@ -51,9 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--val_split", type=float, default=0.2)
-    parser.add_argument("--hidden_sizes", type=str, default="64,32", help="Comma-separated hidden layer sizes.")
+    parser.add_argument("--hidden_sizes", type=str, default="32,16", help="Comma-separated hidden layer sizes.")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
