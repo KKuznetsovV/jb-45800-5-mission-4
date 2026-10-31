@@ -7,6 +7,10 @@ from Kaggle (891 labeled passengers, same data as the classic Kaggle Titanic com
 The dataset CSV is committed at [data/titanic.csv](data/titanic.csv) so `train.py` and
 `predict.py` can run immediately with no external download.
 
+## System design
+
+![Titanic Survival system design](titanic-system-design.png)
+
 ## Setup
 
 ```bash
